@@ -1,0 +1,113 @@
+"""Generated URL shortener. Run: uvicorn main:app --port 8080."""
+import secrets
+import sqlite3
+import time
+from datetime import UTC, datetime
+from ipaddress import ip_address
+from typing import Literal
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
+
+ANALYTICS = __ANALYTICS__
+DB = "links.db"
+clock = time.time
+app = FastAPI(title="Generated URL Shortener", version="1.0.0")
+
+
+def connect():
+    db = sqlite3.connect(DB, timeout=10)
+    db.row_factory = sqlite3.Row
+    db.execute("CREATE TABLE IF NOT EXISTS links (alias TEXT PRIMARY KEY COLLATE NOCASE, "
+               "url TEXT NOT NULL, expires REAL, redirect_type INTEGER NOT NULL)")
+    # Backward-compatible additive upgrade of the frozen greenfield schema.
+    if "expires" not in {row[1] for row in db.execute("PRAGMA table_info(links)")}:
+        db.execute("ALTER TABLE links ADD COLUMN expires REAL")
+    db.execute("CREATE TABLE IF NOT EXISTS clicks (alias TEXT NOT NULL, day TEXT NOT NULL)")
+    return db
+
+
+class CreateLink(BaseModel):
+    target_url: AnyHttpUrl
+    custom_alias: str | None = Field(None, pattern=r"^[a-zA-Z0-9_-]{4,64}$")
+    expires_at: datetime | None = None
+    redirect_type: Literal[301, 302, 307] = 302
+
+    @field_validator("target_url")
+    @classmethod
+    def safe_url(cls, value):
+        if value.username or value.password:
+            raise ValueError("Credentials are not allowed")
+        host = value.host.lower().strip("[]")
+        if host in {"localhost", "localhost.localdomain"} or host.endswith(".local"):
+            raise ValueError("Local destinations are not allowed")
+        try:
+            address = ip_address(host)
+        except ValueError:
+            return value
+        if not address.is_global:
+            raise ValueError("Private destinations are not allowed")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def valid_expiry(cls, value):
+        if value is not None:
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("Timezone required")
+            if value.timestamp() <= clock():
+                raise ValueError("Expiration must be in the future")
+        return value
+
+
+@app.post("/api/links", status_code=201)
+def create(payload: CreateLink):
+    alias = payload.custom_alias or secrets.token_urlsafe(6)
+    if alias.lower() in {"docs", "redoc", "api", "openapi.json"}:
+        raise HTTPException(422, "Reserved alias")
+    expires = payload.expires_at.timestamp() if payload.expires_at else None
+    db = connect()
+    try:
+        with db:
+            db.execute("INSERT INTO links (alias, url, expires, redirect_type) VALUES (?, ?, ?, ?)",
+                       (alias, str(payload.target_url), expires, payload.redirect_type))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Alias already exists") from None
+    finally:
+        db.close()
+    return {"alias": alias, "target_url": str(payload.target_url)}
+
+
+@app.get("/api/links/{alias}/analytics")
+def analytics(alias: str):
+    if not ANALYTICS:
+        raise HTTPException(404, "Analytics not enabled")
+    db = connect()
+    try:
+        if db.execute("SELECT 1 FROM links WHERE alias=?", (alias,)).fetchone() is None:
+            raise HTTPException(404, "Unknown alias")
+        rows = db.execute("SELECT day, COUNT(*) AS clicks FROM clicks "
+                          "WHERE alias=? GROUP BY day ORDER BY day", (alias.lower(),)).fetchall()
+        daily = [{"date": row["day"], "clicks": row["clicks"]} for row in rows]
+        return {"total_clicks": sum(row["clicks"] for row in daily), "daily": daily}
+    finally:
+        db.close()
+
+
+@app.get("/{alias}", include_in_schema=False)
+def redirect(alias: str):
+    db = connect()
+    try:
+        with db:
+            row = db.execute("SELECT * FROM links WHERE alias=?", (alias,)).fetchone()
+            if row is None:
+                raise HTTPException(404, "Unknown alias")
+            if row["expires"] is not None and row["expires"] <= clock():
+                raise HTTPException(410, "Expired")
+            if ANALYTICS:
+                day = datetime.fromtimestamp(clock(), UTC).date().isoformat()
+                db.execute("INSERT INTO clicks VALUES (?, ?)", (alias.lower(), day))
+        return RedirectResponse(row["url"], status_code=row["redirect_type"])
+    finally:
+        db.close()

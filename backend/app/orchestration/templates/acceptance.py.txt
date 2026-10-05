@@ -1,0 +1,81 @@
+"""Independent acceptance contract, maintained by the host, never model supplied."""
+import os
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
+
+import pytest
+from fastapi.testclient import TestClient
+import main
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB", str(tmp_path / "links.db"))
+    with TestClient(main.app) as client:
+        yield client
+
+
+def create(client, alias="acceptance", **extra):
+    return client.post("/api/links", json={
+        "target_url": "https://example.com/path", "custom_alias": alias, **extra,
+    })
+
+
+def test_multiple_aliases_case_conflicts_and_redirects(client):
+    assert create(client).status_code == 201
+    assert create(client, "second-alias").status_code == 201
+    assert create(client, "ACCEPTANCE").status_code == 409
+    response = client.get("/ACCEPTANCE", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://example.com/path"
+    assert client.get("/missing-alias", follow_redirects=False).status_code == 404
+
+
+@pytest.mark.parametrize("url", ["javascript:alert(1)", "http://localhost/a", "http://127.0.0.1/a",
+                                  "https://user:password@example.com/a"])
+def test_unsafe_urls(client, url):
+    assert client.post("/api/links", json={"target_url": url}).status_code == 422
+
+
+@pytest.mark.parametrize("status", [301, 302, 307])
+def test_redirect_contract(client, status):
+    assert create(client, redirect_type=status).status_code == 201
+    assert client.get("/acceptance", follow_redirects=False).status_code == status
+
+
+def test_daily_analytics_and_concurrent_clicks(client):
+    if "analytics" not in os.environ["ACCEPTANCE_FEATURES"]:
+        return
+    assert create(client).status_code == 201
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        statuses = list(pool.map(lambda _: client.get("/acceptance", follow_redirects=False).status_code,
+                                 range(12)))
+    assert statuses == [302] * 12
+    result = client.get("/api/links/acceptance/analytics").json()
+    assert result["total_clicks"] == 12
+    assert sum(row["clicks"] for row in result["daily"]) == 12
+
+
+def test_expiry_and_timezone_contract(client, monkeypatch):
+    if "expiration" not in os.environ["ACCEPTANCE_FEATURES"]:
+        return
+    future = datetime.now(UTC) + timedelta(hours=1)
+    assert create(client, expires_at=future.replace(tzinfo=None).isoformat()).status_code == 422
+    assert create(client, expires_at=(future - timedelta(days=1)).isoformat()).status_code == 422
+    assert create(client, expires_at=future.isoformat()).status_code == 201
+    assert client.get("/acceptance", follow_redirects=False).status_code == 302
+    monkeypatch.setattr(main, "clock", lambda: future.timestamp() + 1)
+    assert client.get("/acceptance", follow_redirects=False).status_code == 410
+
+
+def test_upgrade_preserves_existing_links(client):
+    if "expiration" not in os.environ["ACCEPTANCE_FEATURES"]:
+        return
+    import sqlite3
+    with sqlite3.connect(main.DB) as db:
+        db.execute("CREATE TABLE links (alias TEXT PRIMARY KEY COLLATE NOCASE, url TEXT NOT NULL, redirect_type INTEGER NOT NULL)")
+        db.execute("INSERT INTO links VALUES ('legacy', 'https://example.com/old', 302)")
+    response = client.get("/legacy", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"] == "https://example.com/old"
+    assert create(client).status_code == 201
